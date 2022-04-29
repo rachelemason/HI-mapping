@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #spectral_utils.py
-#REM 2022-04-08
+#REM 2022-04-29
 
 """
 Module containing various classes to open and manipulate GAO data. Intended to be
@@ -12,6 +12,8 @@ import sys
 import shutil
 import copy
 import warnings
+import pickle
+from collections import OrderedDict
 import numpy as np
 import rasterio
 from rasterio.windows import Window
@@ -22,8 +24,9 @@ import scipy
 from shapely.geometry import shape, mapping
 import fiona
 import geopandas as gpd
-warnings.simplefilter(action='ignore', category=FutureWarning) #for unfixable Pandas FutureWarnings
 import sampleraster #spectral extraction code (written by NV)
+warnings.simplefilter(action='ignore', category=FutureWarning) #for unfixable Pandas FutureWarnings
+
 
 
 class Prepare():
@@ -31,12 +34,15 @@ class Prepare():
     Class for doing simple things like reading raster files and brightness-normalizing spectra
     """
 
-    def __init__(self, data_path, out_path):
+    def __init__(self, data_path, header_path, out_path):
         self.data_path = data_path
         self.out_path = out_path
+        if not os.path.isdir(self.out_path):
+            os.makedirs(self.out_path)
+        self.header_path = header_path
 
 
-    def read_roi(self, file, roi):
+    def read_raster(self, file, roi=None):
         """
         Read all bands of region of interest <roi> in raster file, <file>, and return
         a 3D numpy array (bands, x, y) and the metadata needed for later writing the
@@ -45,28 +51,28 @@ class Prepare():
 
         with rasterio.open(self.data_path+file, 'r') as f:
 
-            #read the ROI
-            window = Window(roi[0], roi[1], roi[2], roi[3])
-            arr = f.read(window=window)
+            #read the entire file or the ROI
+            print(f'Reading {self.data_path+file}')
+
+            meta = f.meta.copy()
+
+            if roi is None:
+                arr = f.read()
+
+            else:
+                window = Window(roi[0], roi[1], roi[2], roi[3])
+                arr = f.read(window=window)
+
+                #get the correct metadata for this ROI
+                meta.update({
+                'height': window.height,
+                'width': window.width,
+                'transform': f.window_transform(window)})
 
             #convert array to float so as to be able to set bad values
             #(e.g. regions affected by telluric H2O) and ignore them in calculations
 
             arr = arr.astype(float)
-            #set bad/nodata values to np.nan (although I haven't seen any so far)
-            try:
-                #nodata values are -9999.0 for some files, so do an approx. check
-                arr[abs(arr - float(f.meta['nodata'])) < 0.1] = np.nan
-            except TypeError:
-                #nodata values are not defined for some (e..g shade masks)
-                pass
-
-            #get the correct metadata for this ROI
-            meta = f.meta.copy()
-            meta.update({
-            'height': window.height,
-            'width': window.width,
-            'transform': f.window_transform(window)})
 
         return arr, meta
 
@@ -90,8 +96,8 @@ class Prepare():
         frac = shaded / (shade_mask.shape[0] * shade_mask.shape[1])
         print(f"{frac*100 :.1f}% of pixels are classed as shaded")
 
-        #set all pixels in the "shaded" category to NaN
-        masked = np.where((shade_mask == 127), np.nan, arr)
+        #set all pixels not in the "sunlit vegetation" category to NaN
+        masked = np.where((shade_mask != 255), np.nan, arr)
 
         if show:
             #display a single (blue, arbitrarily) band that shows the shaded pixels
@@ -103,49 +109,6 @@ class Prepare():
         return masked
 
 
-    @classmethod
-    def identify_water_bands(cls, arr, bandval):
-        """
-        Set the spectral regions in <arr> badly affected by telluric H2O to <bandval>. The
-        locations of the water bands were first defined by stepping through
-        bands in ENVI and looking for the blank images.
-        """
-
-        water_bands = [list(range(0,5)), list(range(101, 107)), list(range(146, 179)), [213]]
-        for badbit in water_bands:
-            for index, _ in enumerate(arr):
-                if index in badbit:
-                    arr[index, :, :] = bandval
-
-        return arr
-
-
-    def brightness_norm(self, arr):
-        """
-        Brightness normalise spectra of all locations in a data cube. In pseudo-code, this
-        means for an x,y image with z spectral bands:
-        for x,y location in array:
-            find the vector norm of the z direction (sum of absolute values at each wavelength)
-            divide all z pixels by this number
-        This effectively removes the effect of things like viewing angle that would otherwise
-        make some pixels brighter than others regardless of their intrinsic spectra.
-        This method also sets regions of poor atmospheric H2) correction to NaN
-        (see self.identify_water_bands).
-        """
-
-        #We want to exclude telluric H2O regions from calculation, but
-        #NaNs and masked arrays don't seem to work with np.linalg.norm, so we
-        #temporarily set those spectral regions to 0
-        arr = self.identify_water_bands(arr, bandval=0)
-
-        norm = arr / scipy.linalg.norm(arr, axis=0)
-
-        #Now set the H20 regions to np.nan
-        norm = self.identify_water_bands(norm, bandval=np.nan)
-
-        return norm
-
-
     def read_wavelengths(self, hdr_file):
         """
         Returns the a list containing the wavelength of each band in a reflectance data cube,
@@ -153,7 +116,7 @@ class Prepare():
         """
 
         wavelengths = []
-        with open(self.data_path+hdr_file, 'r', encoding='utf8') as f:
+        with open(self.header_path+hdr_file, 'r', encoding='utf8') as f:
             read = False
             for line in f:
                 if 'wavelength = ' in line:
@@ -169,12 +132,15 @@ class Prepare():
         return wavelengths
 
 
-    def write_roi(self, arr, meta, filename):
+    def write_raster(self, arr, meta, filename):
         """
-        Write the roi created by read_roi, optionally modified by methods such as
-        self.brightness_norm(), to a raster.
+        Write a raster: an ROI read by self.read_master, or an ROI or full frame
+        that has been modified by e.g. self.apply_shade_mask.
         """
 
+        #self.read_raster converts arrays to float, so need to also write as float
+        #to avoid small numbers being rounded to zero
+        meta.update({'dtype': 'float32', 'driver': 'GTiff'})
         with rasterio.open(self.out_path+filename, 'w', **meta) as f:
             f.write(arr)
 
@@ -294,14 +260,18 @@ class Display():
 
 
     @classmethod
-    def show_rgb(cls, rgb, ax, percentile=2):
+    def show_rgb(cls, rgb, meta, ax, percentile=2):
         """
         Display a color image using histogram clipping. Works OK with images containing
         NaN values.
         """
 
-        p_low, p_high = np.percentile(rgb[~np.isnan(rgb)], (percentile, 100 - percentile))
-        img_rescale = exposure.rescale_intensity(rgb, in_range=(p_low, p_high))
+        #Set nodata values to NaN to avoid -9999.0 dominating displayed images
+        tmp = rgb.copy()
+        tmp[abs(tmp - float(meta['nodata'])) < 0.1] = np.nan
+
+        p_low, p_high = np.percentile(tmp[~np.isnan(tmp)], (percentile, 100 - percentile))
+        img_rescale = exposure.rescale_intensity(tmp, in_range=(p_low, p_high))
         ax.imshow(img_rescale, interpolation=None)
 
 
@@ -312,14 +282,14 @@ class Extract():
     the spectral extraction code, sampleraster.py.
     """
 
-    def __init__(self, feature_path, plot_path):
+    def __init__(self, feature_path, output_path):
         self.feature_path = feature_path #path to shapefiles containing features to be extracted
-        self.plot_path = plot_path #directory where plots will live
-        if not os.path.isdir(self.plot_path):
-            os.makedirs(self.plot_path)
+        self.output_path = output_path #directory where spectra and plots will live
+        if not os.path.isdir(self.output_path):
+            os.makedirs(self.output_path)
 
 
-    def extract(self, feature_file, raster):
+    def extract(self, feature_file, raster, brightness_norm=True):
         """
         Call sampleraster.py to extract feature spectra from a shapefile, return a
         dictionary of feature spectra.
@@ -337,18 +307,17 @@ class Extract():
               value=spectrum of that feature.
         """
 
-        #And for some reason sampleraster.py can't open the shapefiles if they're in
+        #For some reason sampleraster.py can't open the shapefiles if they're in
         #/data/gdcsdata/test_directory/rmason_test/ (something to do with it being mapped
-        #from gdcs-remote?), so copy them to a temp dir here
+        #from gdcs-remote?), so copy them to a temp dir here. In addition to .shp, .shx
+        #is needed by sampleraster and .dbf is needed for geopandas to read feature
+        #labels/attributes as well as geometries
 
-        temp_name = self.feature_path+feature_file
         if not os.path.isdir('temp'):
             os.makedirs('temp')
-        shutil.copyfile(temp_name, f"temp/{feature_file}")
-        #copy the associated files, too - .shx needed by sampleraster, .dbf needed
-        #for geopandas to read feature labels/attributes as well as just geometries
-        for suffix in ['shx', 'dbf']:
-            shutil.copyfile(temp_name.replace('shp', suffix),\
+        tmp_name = self.feature_path+feature_file
+        for suffix in ['shp', 'shx', 'dbf']:
+            shutil.copyfile(tmp_name.replace('shp', suffix),\
                             f"temp/{feature_file.replace('shp', suffix)}")
 
         #Extract the spectra
@@ -372,44 +341,95 @@ class Extract():
                 os.remove('temp.shp')
             shutil.rmtree('temp', ignore_errors=True)
 
-            #write the polygon for this feature into its own (new) file
+            #write the polygon for this feature into its own (new) file in the current dir,
+            #which sampleraster will use for the extraction of this feature
             features[i: i+1].to_file('temp.shp')
 
-            #extract the spectrum of each pixel in this feature (quietly)
+            #extract the spectrum of each pixel in this feature
             sys.argv = ['./sampleraster.py', 'temp.shp', 'temp', raster]
             sampleraster.main()
 
-            #get the spectrum of each pixel, add it to a list of spectra, create mean spectrum
-            #of all pixels
+            #get the spectrum of each pixel, optionally brightness-normalize, add it to a list
+            #of spectra, create mean spectrum of all pixels in the feature
             feature_pix = 0 #count number of pixels in feature
             for point in fiona.open("temp/temp.shp"):
                 values = []
-                spectrum = point['properties'] #this is where the reflectance values are kept
-                for wav, value in spectrum.items():
-                    if wav[0].isdigit(): #some dict keys don't contain wavelengths but other info
+                #reflectance values are kept in point['properties'] dictionary
+                for wav, value in point['properties'].items():
+                    if wav[0].isdigit(): #find the dict keys that contain wavelengths
                         values.append(value) #build up the spectrum of this pixel
+
+                #brightness-normalize the spectrum for this pixel (also takes care of setting
+                #water bands to NaN)
+                if brightness_norm:
+                    values = self.brightness_norm(values)
+                #or just set water bands to NaN
+                else:
+                    self.identify_water_bands(values, bandval=np.nan)
 
                 #add the spectrum to any existing spectra for this feature, to build up the
                 #summed spectrum
                 if key not in spectra:
                     spectra[key] = values
                 else:
-                    sumlists = [x + y for (x, y) in zip(spectra[key], values)]
-                    spectra[key] = sumlists
+                    spectra[key] = [x + y for (x, y) in zip(spectra[key], values)]
                 feature_pix += 1
 
             #divide by the number of pixels in this feature to get the mean spectrum for the feature
             spectra[key] = [y / feature_pix  for y in spectra[key]]
 
-        #Remove the temp directory and anything in it
-        #This doesn't seem to work - why?
-        shutil.rmtree('temp/', ignore_errors=True)
+        #Remove the temp directory and anything in it (but usually fails because files are open)
+        shutil.rmtree('temp', ignore_errors=True)
         #Remove remaining temp files
         for f in ['temp.shp', 'temp.shx', 'temp.dbf', 'temp.cpg']:
             if os.path.isfile(f):
                 os.remove(f)
 
+        #save the extracted spectra for analysis (e.g. PCA) in other notebooks
+        with open(self.output_path+'spectra.pkl', 'wb') as f:
+            pickle.dump(spectra, f)
+
         return spectra
+
+
+    @classmethod
+    def identify_water_bands(cls, spectrum, bandval):
+        """
+        Set the spectral regions in <arr> badly affected by telluric H2O to <bandval>. The
+        locations of the water bands were first defined by stepping through
+        bands in ENVI and looking for the blank images.
+        """
+
+        water_bands = [list(range(0,5)), list(range(99, 108)), list(range(142, 179)), [213]]
+        for badbit in water_bands:
+            for band, _ in enumerate(spectrum):
+                if band in badbit:
+                    spectrum[band] = bandval
+
+        return spectrum
+
+
+    def brightness_norm(self, arr):
+        """
+        Brightness normalise a 1D spectrum, i.e., find the vector norm (sum of absolute values
+        at each wavelength), and divide all pixels by this number.
+        This effectively removes the effect of things like viewing angle that would otherwise
+        make some pixels brighter than others regardless of their intrinsic spectra.
+        This method also sets regions of poor atmospheric H20 correction to NaN
+        (see self.identify_water_bands).
+        """
+
+        #We want to exclude telluric H2O regions from calculation, but
+        #NaNs and masked arrays don't seem to work with np.linalg.norm, so we
+        #temporarily set those spectral regions to 0
+        arr = self.identify_water_bands(arr, bandval=0)
+
+        norm = arr / scipy.linalg.norm(arr, axis=0)
+
+        #Now set the H20 regions to np.nan
+        norm = self.identify_water_bands(norm, bandval=np.nan)
+
+        return norm
 
 
     @classmethod
@@ -429,16 +449,24 @@ class Extract():
         return idx
 
 
-    def plot_spectra(self, spectra, wavelengths, ylabel, normalize_at=None, indicate_wavs=None,\
-                     figname=None):
+    def plot_spectra(self, spectra, wavelengths, include=None, exclude=None, ylabel='',\
+                     normalize_at=None, indicate_wavs=None, figname=None, ylims=None):
         """
         Display a simple plot of all the spectra in the input dictionary
         of feature spectra. Requires a list of wavelengths for each pixel;
         see Prepare.read_wavelengths.
         """
 
-        classes = sorted(list({x[1] for x in spectra.keys()}))
-        fig, _ = plt.subplots(2, 3, figsize=(16, 8))
+        classes = list({x[1] for x in spectra.keys()})
+        if exclude is not None:
+            classes = [c for c in classes if c not in exclude]
+        if include is not None:
+            classes = include
+        if include is None and exclude is None:
+            classes = sorted(classes)
+
+        rows = int(np.ceil(len(classes) / 3))
+        fig, _ = plt.subplots(rows, 3, figsize=(16, 4*rows))
 
         if normalize_at is not None:
             idx = self.find_wavelength(wavelengths, normalize_at)
@@ -448,7 +476,7 @@ class Extract():
                 clazz = classes[i]
             except IndexError:
                 ax.axis('off')
-                break
+                continue
 
             for feature, spectrum in spectra.items():
                 if feature[1] == clazz:
@@ -456,7 +484,8 @@ class Extract():
                     #sampleraster seems to set (most) water bands to 0;
                     #change to NaN to omit from plots. Also, divide reflectance
                     #by 100 to get into % (per advice from Robin, 2022-03-29)
-                    spectrum = [np.nan if y == 0 else y/100 for y in spectrum ]
+                    #BUT ONLY RELEVANT IF SPECTRA NOT BRIGHTNESS NORMALIZED
+                    #spectrum = [np.nan if y == 0 else y/100 for y in spectrum ]
 
                     if normalize_at is not None:
                         spectrum = [s/spectrum[idx] for s in spectrum]
@@ -468,18 +497,73 @@ class Extract():
                     for wav in indicate_wavs:
                         ax.axvline(wav, ls='dotted', color='gray', lw=0.5)
 
-                if normalize_at is None:
-                    ax.set_ylim(0, 80)
+                ax.axvline(750, ls=':', color='0.5')
+                if ylims is not None:
+                    ax.set_ylim(ylims)
                 ax.set_xlim(390, 2500)
                 ax.xaxis.set_major_locator(plt.MaxNLocator(5))
                 ax.set_ylabel(ylabel)
                 ax.set_xlabel('Wavelength, nm')
-                ax.set_title(clazz.replace('\\', ''))
-            ax.legend(ncol=2)
+                try:
+                    ax.set_title(clazz.split(':')[1].replace('\\', ''))
+                except IndexError:
+                    ax.set_title(clazz.replace('\\', ''))
+
+            ax.legend(ncol=3)
 
         plt.tight_layout()
         if figname is not None:
-            fig.savefig(self.plot_path+figname)
+            fig.savefig(self.output_path+figname)
+
+
+    @classmethod
+    def order_spectra(cls, spectra, key_list):
+        """
+        Create an ordered dictionary of spectra to be passed to self.plot_single_category()
+        """
+
+        return OrderedDict((k, spectra[k]) for k in key_list if k in spectra)
+
+
+    def plot_single_category(self, spectra, wavelengths, **kwargs):
+        """
+        A lot like self.plot_spectra(), but for plotting only one category of spectra, each one
+        in its own set of axes. This was written for classifying roof spectra by eye, because
+        there were quite a lot of them.
+        """
+
+        kwargs.setdefault('color', 'k')
+        kwargs.setdefault('indicate', None)
+        kwargs.setdefault('rows', 11)
+        kwargs.setdefault('cols', 8)
+        kwargs.setdefault('figsize', (16, 18))
+        kwargs.setdefault('fname', None)
+
+        fig, _ = plt.subplots(kwargs['rows'], kwargs['cols'], figsize=kwargs['figsize'])
+
+        count = 0
+        for feature, spectrum in spectra.items():
+            ax = fig.axes[count]
+            ax.plot(wavelengths, spectrum, label=feature[0], color=kwargs['color'], lw=1)
+            if kwargs['indicate'] is not None:
+                ax.axvline(kwargs['indicate'], ls=':', lw=0.75, color='gray')
+            ax.tick_params(axis='both', which='both', bottom=False, left=False,\
+                              labelbottom=False, labelleft=False)
+            ax.text(0.98, 0.98, feature[0], transform=ax.transAxes, ha='right', va='top')
+            count += 1
+
+        for num in range(count, len(fig.axes)):
+            ax = fig.axes[num]
+            ax.axis('off')
+
+        try:
+            plt.suptitle(kwargs['title'])
+        except KeyError:
+            pass
+        plt.subplots_adjust(wspace=0, hspace=0)
+
+        if kwargs['fname'] is not None:
+            plt.savefig(self.output_path+kwargs['fname'], dpi=450)
 
 
     def index_plot(self, spectra, wavelengths, index_wavs):
