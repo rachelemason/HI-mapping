@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #spectral_utils.py
-#REM 2022-04-29
+#REM 2022-05-02
 
 """
 Module containing various classes to open and manipulate GAO data. Intended to be
@@ -385,10 +385,6 @@ class Extract():
             if os.path.isfile(f):
                 os.remove(f)
 
-        #save the extracted spectra for analysis (e.g. PCA) in other notebooks
-        with open(self.output_path+'spectra.pkl', 'wb') as f:
-            pickle.dump(spectra, f)
-
         return spectra
 
 
@@ -605,6 +601,26 @@ class Extract():
 
         ax2.set_xlabel(f'Reflectance at {index_wavs[0]} nm')
         ax2.set_ylabel(f'Reflectance at {index_wavs[1]} nm')
+
+
+    def combine_and_save(self, all_spectra, categorized):
+        """
+        Replace generic Roof spectra with categorized spectra in dictionary of all
+        spectra, and pickle for later use
+        """
+
+        #Remove the generic roofing spectra
+        keys = [key for key in all_spectra.keys() if key[1] == 'Roof']
+        for key in keys:
+            all_spectra.pop(key)
+       
+        #Replace with categorized roofing spectra
+        for key, value in categorized.items():
+            all_spectra[key] = value
+
+        #Save for use as training dataset in other notebooks
+        with open(self.output_path+'spectra.pkl', 'wb') as f:
+            pickle.dump(all_spectra, f)
 
 
 if __name__ == "__main__":
