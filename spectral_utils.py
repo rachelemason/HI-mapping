@@ -37,8 +37,9 @@ class Prepare():
     def __init__(self, data_path, header_path, out_path):
         self.data_path = data_path
         self.out_path = out_path
-        if not os.path.isdir(self.out_path):
-            os.makedirs(self.out_path)
+        if out_path is not None:
+            if not os.path.isdir(self.out_path):
+                os.makedirs(self.out_path)
         self.header_path = header_path
 
 
@@ -396,8 +397,8 @@ class Extract():
         bands in ENVI and looking for the blank images.
         """
 
-        water_bands = [list(range(0,5)), list(range(99, 108)), list(range(142, 179)), [213]]
-        for badbit in water_bands:
+        bad_bands = [list(range(0,5)), list(range(99, 112)), list(range(142, 179)), [213]]
+        for badbit in bad_bands:
             for band, _ in enumerate(spectrum):
                 if band in badbit:
                     spectrum[band] = bandval
