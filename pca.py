@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #pca.py
-#REM 2022-05-04
+#REM 2022-05-16
 
 """
 Contains classes for running PCA on extracted VSWIR spectra, and interpreting the
@@ -9,11 +9,12 @@ output
 
 import pickle
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA as skl_PCA
-import spectral_utils
+from sklearn.cluster import KMeans
 
 
 class PCA():
@@ -36,7 +37,22 @@ class PCA():
 
         with open(self.data_path, 'rb') as f:
             self.spectra = pickle.load(f)
-
+            
+            
+    def cut_spectra(self, wavelengths, start_wavelength):
+        """
+        Remove the portion of the spectra before <start_wavelength>. For
+        testing whether removing the visible portion of the spectra makes
+        them more separable into sensible categories.
+        """
+        
+        wavelengths = [int(w) for w in wavelengths]
+        print(wavelengths)
+        start_idx = wavelengths.index(start_wavelength)
+        
+        for label, spectrum in self.spectra.items():
+            self.spectra[label] = spectrum[start_idx:]
+            
 
     def run_pca(self):
         """
@@ -149,7 +165,6 @@ class Diagnostics():
 
             if ':' in label:
                 label=label.split(':')[1].strip()
-
             try:
                 color = style[label][0]
                 marker = style[label][1]
@@ -159,7 +174,7 @@ class Diagnostics():
                 continue
 
             ax.scatter(x, y, color=color, edgecolor='k', marker=marker, s=size,\
-                       alpha=0.5, label=label)
+                       alpha=0.5)
             if annotate:
                 for n, i, j in zip(id_num, x, y):
                     ax.annotate(n, (i, j))
@@ -175,7 +190,8 @@ class Diagnostics():
 
     def pair_plot(self, start=0, num=5, annotate=False, fname=None):
         """
-        Create a figure that shows
+        Create a figure that shows each PC between <start> and <num>
+        plotted against each other one. Makes a grid of num*num plots.
         """
 
         fig, _ = plt.subplots(num, num, figsize=(16, 16))
@@ -235,13 +251,13 @@ class Diagnostics():
         return nan_idx
 
 
-    def loadings(self, header_path, header_file):
+    def loadings(self, wavelengths, cut=None):
         """
         Make a plot that shows PC loadings for the first 12 components
         """
 
-        prep = spectral_utils.Prepare(data_path=None, header_path=header_path, out_path=None)
-        wavelengths = prep.read_wavelengths(hdr_file=header_file)
+        if cut is not None:
+            wavelengths = [w for w in wavelengths if w >= cut]
 
         #Find where NaNs were excluded from PCA
         #(regions of poor H2O cancellation)
@@ -260,6 +276,125 @@ class Diagnostics():
             ax.set_ylim(-0.3, 0.3)
             if comp == 10:
                 ax.set_xlabel('Wavelength, nm')
+
+
+class Clustering():
+    """
+    Methods to do unsupervised clustering (probably just k-means)
+    """
+    
+    def __init__(self, pca_results, spectra, plot_path):
+        self.pca_results = pca_results
+        self.comps = pca_results[1]
+        self.spectra = spectra
+        self.plot_path = plot_path
+
+
+    def kmeans(self, n_components=10, n_clusters=10):
+        """
+        Perform k-means clustering on components found by PCA.run_pca()
+        """
+        
+        km = KMeans(n_clusters=n_clusters)
+        
+        comps = [comp[0: n_components] for comp in self.comps]
+        clusters = km.fit_predict(comps)
+
+        df = pd.DataFrame()
+        df.index = [k[0] for k in self.spectra.keys()]
+        df['Label'] = [k[1] for k in self.spectra.keys()]
+        df['Cluster membership'] = clusters
+        df['PCA'] = comps
+        groups = df.groupby(by='Cluster membership')
+        for _, group in groups:
+            display(group[['Label', 'Cluster membership']])
+        
+        return df
+    
+    @staticmethod
+    def colordict():
+        """
+        Define a color for each k-means cluster, to be used in PCA pair plots and
+        for plotting spectra by cluster
+        """
+
+        return {1: 'k', 2: 'r', 3: 'blue', 4: 'cyan', 5: 'orange', 6: 'limegreen',\
+                     7: 'yellow', 8: 'olive', 9: 'darkgreen', 0: 'hotpink'}
+
+
+    def pairplots_by_cluster(self, cluster_info, start=0, num=5, fname=None):
+        """
+        Make pairplots like in Diagnostics.pair_plots, but this time the points
+        are coloured by k-means cluster instead of by user-defined description/class.
+        """
+
+        colordict = self.colordict()
+
+        fig, _ = plt.subplots(num, num, figsize=(16, 16))
+
+        i = start
+        j = start
+        for n, ax in enumerate(fig.axes):
+            for _, data in cluster_info.iterrows():
+                x = data['PCA'][i]
+                y = data['PCA'][j]
+                ax.scatter(x, y, color=colordict[data['Cluster membership']], edgecolor='k', marker='o', s=60,\
+                       alpha=0.8)
+
+                if i == start:
+                    ax.set_ylabel(f"PC{j+1}")
+                if j == start + (num - 1):
+                    ax.set_xlabel(f"PC{i+1}")
+
+                ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+
+            if i == start + (num - 1):
+                j += 1
+                i = start
+            else:
+                i += 1
+
+        plt.subplots_adjust(wspace=0, hspace=0)
+
+        if fname is not None:
+            plt.savefig(self.plot_path+fname)
+
+
+    def spectra_by_cluster(self, cluster_membership, wavelengths, start_wavelength=None):
+        """
+        """
+
+        clusters = cluster_membership['Cluster membership'].unique()
+        colordict = self.colordict()
+
+        rows = int(np.ceil(len(clusters) / 3))
+        fig, _ = plt.subplots(rows, 3, figsize=(12, rows*3))
+
+        for ax, (n, cluster) in zip(fig.axes, enumerate(clusters)):
+            color = colordict[cluster]
+            for idx, spectrum in self.spectra.items():
+                try:
+                    which_cluster = cluster_membership.loc[idx[0], 'Cluster membership']
+                except KeyError:
+                    pass
+                if which_cluster == cluster:
+                    ax.plot(wavelengths, spectrum, color=color)
+            ax.text(0.98, 0.98, cluster, transform=ax.transAxes, ha='right', va='top')
+
+            if start_wavelength is not None:
+                ax.set_xlim(start_wavelength, 2500)
+            ax.set_ylim(0, 0.174)
+            if n not in [0, 3, 6]:
+                ax.tick_params(left=False, labelleft=False)
+            else:
+                ax.set_ylabel('Normalized reflectance')
+            ax.set_xlabel('Wavelength, nm')
+
+        for n, ax in enumerate(fig.axes):
+            if n >= len(clusters):
+                ax.axis('off')
+
+        plt.subplots_adjust(wspace=0, hspace=0)
 
 
 if __name__ == "__main__":
